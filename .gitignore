@@ -1,8 +1,12 @@
 config.yaml
 .env
 history.json
+history.json.bak
 messages.json
+messages.json.bak
 messages_123.json
+messages_123.json.bak
+data/
 downloads/
 __pycache__/
 *.pyc

@@ -83,17 +83,28 @@ channel_match: []
 #   password:
 
 link_checker:
-  delete_mode: 2                   # 1:检测并删除  2:仅检测标记  3:删除已标记失效
+  delete_mode: 4                   # 1:删除  2:仅检测  3:删已标记  4:编辑标记(推荐)
   limit: 1000
   concurrency: 20
   recheck: true
+  edit_invalid: true
   json_path_normal: "messages.json"
   json_path_123: "messages_123.json"
   batch_size: 500
   net_disk_domains:
     - "pan.quark.cn"
-    # - "aliyundrive.com"
-    # - "alipan.com"
+
+tmdb:
+  enabled: false
+  api_key: ""
+  language: zh-CN
+
+database:
+  path: "data/tgforwarder.db"
+
+admin:
+  user_ids: []
+  schedule_interval_minutes: 0
 
 logging:
   level: INFO

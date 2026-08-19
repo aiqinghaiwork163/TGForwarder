@@ -12,25 +12,39 @@ from bs4 import BeautifulSoup
 from utils.link_utils import extract_share_id, extract_net_disk_urls
 from utils.config_loader import build_proxy
 from utils.logging_setup import setup_logging
+from utils.database import Database
 
 
 class TelegramLinkManager:
-    def __init__(self, config):
+    INVALID_MARKER = "⚠️ 含失效链接"
+
+    def __init__(self, config, client=None, db=None):
         log_level = config.get("LOG_LEVEL", "INFO")
         self.logger = setup_logging(log_level)
         self.config = config
-        # 初始化Telethon客户端
-        self.client = TelegramClient(
-            StringSession(config["STRING_SESSION"]), 
-            config["API_ID"], 
-            config["API_HASH"], 
-            proxy=config["PROXY"]
+        db_path = config.get("DB_PATH", "data/tgforwarder.db")
+        self.db = db or Database(db_path)
+        self.db.migrate_link_check_json(
+            config.get("JSON_PATH_NORMAL", "messages.json"),
+            config.get("JSON_PATH_123", "messages_123.json"),
         )
+        if client:
+            self.client = client
+            self._owns_client = False
+        else:
+            self.client = TelegramClient(
+                StringSession(config["STRING_SESSION"]),
+                config["API_ID"],
+                config["API_HASH"],
+                proxy=config["PROXY"],
+            )
+            self._owns_client = True
         self.json_path_normal = config["JSON_PATH_NORMAL"]
         self.json_path_123 = config["JSON_PATH_123"]
         self.target_channel = config["TARGET_CHANNEL"]
         self.batch_size = config["BATCH_SIZE"]
         self.net_disk_domains = config["NET_DISK_DOMAINS"]
+        self.edit_mode = config.get("EDIT_INVALID", True)
 
     @classmethod
     def from_config(cls, cfg: dict) -> "TelegramLinkManager":
@@ -38,6 +52,7 @@ class TelegramLinkManager:
         tg = cfg["telegram"]
         lc = cfg.get("link_checker", {})
         log_cfg = cfg.get("logging", {})
+        db_cfg = cfg.get("database", {})
         config = {
             "API_ID": tg["api_id"],
             "API_HASH": tg["api_hash"],
@@ -53,6 +68,8 @@ class TelegramLinkManager:
             "RECHECK": lc.get("recheck", True),
             "NET_DISK_DOMAINS": lc.get("net_disk_domains"),
             "LOG_LEVEL": log_cfg.get("level", "INFO"),
+            "DB_PATH": db_cfg.get("path", "data/tgforwarder.db"),
+            "EDIT_INVALID": lc.get("edit_invalid", True),
         }
         return cls(config)
 
@@ -88,66 +105,43 @@ class TelegramLinkManager:
         except Exception as e:
             self.logger.error(f"保存JSON失败: {e}, 路径: {json_path}")
 
-    # 获取并保存所有新消息（分批处理）
     async def fetch_and_save_all_messages(self, limit=None):
-        """分批获取所有新消息并保存到JSON"""
-        data_normal = await self.load_json_data(self.json_path_normal)
-        data_123 = await self.load_json_data(self.json_path_123)
-
-        last_processed_id = max(data_normal.get("last_processed_id", 0),
-                                data_123.get("last_processed_id", 0))
-        offset_id = last_processed_id
+        """分批获取新消息并保存到 SQLite。"""
+        offset_id = self.db.get_link_check_last_id()
         total_new_messages = 0
 
         while True:
-            new_messages_normal = []
-            new_messages_123 = []
             messages_fetched = 0
-
             try:
                 async for message in self.client.iter_messages(
                     self.target_channel,
                     min_id=offset_id,
                     reverse=True,
-                    limit=self.batch_size
+                    limit=self.batch_size,
                 ):
                     if message is None:
                         break
                     text = message.text or ""
                     links = self.extract_links(text)
                     if links:
-                        message_data = {
-                            "message_id": message.id,
-                            "urls": links,
-                            "invalid_urls": []
-                        }
-                        if any("123" in url for url in links):
-                            new_messages_123.append(message_data)
-                        else:
-                            new_messages_normal.append(message_data)
+                        is_123 = any("123" in url for url in links)
+                        self.db.upsert_link_check_message(message.id, links, is_123)
                         offset_id = max(offset_id, message.id)
                         messages_fetched += 1
                         total_new_messages += 1
                         if limit and total_new_messages >= limit:
                             break
 
-                if new_messages_normal or new_messages_123:
-                    data_normal["messages"].extend(new_messages_normal)
-                    data_123["messages"].extend(new_messages_123)
-                    data_normal["last_processed_id"] = offset_id
-                    data_123["last_processed_id"] = offset_id
-                    await self.save_json_data(data_normal, self.json_path_normal)
-                    await self.save_json_data(data_123, self.json_path_123)
-                    self.logger.info(f"本批次保存了 {len(new_messages_normal) + len(new_messages_123)} 条消息，总计 {total_new_messages} 条")
+                if offset_id > self.db.get_link_check_last_id():
+                    self.db.set_link_check_last_id(offset_id)
 
                 if messages_fetched == 0 or (limit and total_new_messages >= limit):
                     break
-
             except Exception as e:
                 self.logger.error(f"获取消息失败: {e}")
                 break
 
-        self.logger.info(f"所有新消息保存完成，总计 {total_new_messages} 条")
+        self.logger.info(f"新消息保存完成，总计 {total_new_messages} 条")
 
     def extract_share_id(self, url: str):
         """从链接中提取分享ID（委托 utils）。"""
@@ -291,232 +285,171 @@ class TelegramLinkManager:
                 self.logger.info(f"链接 {url} 检测完成，结果: {result}")
             return result
 
-    # 处理消息（批量检测）
-    async def process_messages(self, delete, concurrency=500):
-        data_normal = await self.load_json_data(self.json_path_normal)
-        data_123 = await self.load_json_data(self.json_path_123)
-
-        if delete == 1 or delete == 2:
-            all_urls_123 = []
-            all_urls_normal = []
-            url_to_message = {}
-
-            for message in data_normal["messages"] + data_123["messages"]:
-                for url in message["urls"]:
-                    if "123" in url:
-                        all_urls_123.append(url)
-                    else:
-                        all_urls_normal.append(url)
-                    url_to_message[url] = message
-
-            self.logger.info(f"总共有 {len(all_urls_123)} 条123网盘链接和 {len(all_urls_normal)} 条其他网盘链接需要检测")
-
-            semaphore_123 = asyncio.Semaphore(min(10, concurrency))
-            semaphore_normal = asyncio.Semaphore(concurrency)
-
-            async def check_with_semaphore(url, semaphore):
-                return await self.check_url(url, semaphore)
-
-            # 检查123网盘链接
-            if all_urls_123:
-                tasks_123 = [check_with_semaphore(url, semaphore_123) for url in all_urls_123]
-                try:
-                    results_123 = await asyncio.wait_for(
-                        asyncio.gather(*tasks_123, return_exceptions=True),
-                        timeout=max(120.0, len(all_urls_123) / 10 * 10)
-                    )
-                    for url, result in zip(all_urls_123, results_123):
-                        if not result or isinstance(result, Exception):
-                            if url not in url_to_message[url]["invalid_urls"]:  # 避免重复添加
-                                url_to_message[url]["invalid_urls"].append(url)
-                except asyncio.TimeoutError:
-                    self.logger.error(f"123网盘链接检测超时，总链接数: {len(all_urls_123)}")
-                    for url in all_urls_123:
-                        if url not in url_to_message[url]["invalid_urls"]:
-                            url_to_message[url]["invalid_urls"].append(url)
-
-            # 检查其他网盘链接
-            if all_urls_normal:
-                tasks_normal = [check_with_semaphore(url, semaphore_normal) for url in all_urls_normal]
-                try:
-                    results_normal = await asyncio.wait_for(
-                        asyncio.gather(*tasks_normal, return_exceptions=True),
-                        timeout=max(120.0, len(all_urls_normal) / concurrency * 10)
-                    )
-                    for url, result in zip(all_urls_normal, results_normal):
-                        if not result or isinstance(result, Exception):
-                            if url not in url_to_message[url]["invalid_urls"]:  # 避免重复添加
-                                url_to_message[url]["invalid_urls"].append(url)
-                except asyncio.TimeoutError:
-                    self.logger.error(f"其他网盘链接检测超时，总链接数: {len(all_urls_normal)}")
-                    for url in all_urls_normal:
-                        if url not in url_to_message[url]["invalid_urls"]:
-                            url_to_message[url]["invalid_urls"].append(url)
-
-        if delete == 1:
-            for data in [data_normal]:  # 只处理普通网盘
-                messages = data["messages"]
-                for message in messages[:]:
-                    if message["invalid_urls"]:
-                        try:
-                            await self.client.delete_messages(self.target_channel, message["message_id"])
-                            self.logger.info(f"删除失效消息: {message['message_id']}")
-                            messages.remove(message)
-                        except RPCError as e:
-                            self.logger.error(f"删除消息失败: {e}")
-            
-            # 对于123网盘消息，只有在所有链接都失效时才删除
-            self.logger.warning("注意：123网盘检测较为严格，可能会有误判，请谨慎删除")
-            messages_123 = data_123["messages"]
-            for message in messages_123[:]:
-                if message.get("invalid_urls") and len(message.get("invalid_urls", [])) == len(message.get("urls", [])):
-                    try:
-                        await self.client.delete_messages(self.target_channel, message["message_id"])
-                        self.logger.info(f"删除123网盘失效消息: {message['message_id']}")
-                        messages_123.remove(message)
-                    except RPCError as e:
-                        self.logger.error(f"删除123网盘消息失败: {e}")
-        elif delete == 3:
-            # 处理普通网盘
-            messages = data_normal["messages"]
-            for message in messages[:]:
-                if message.get("invalid_urls"):
-                    try:
-                        await self.client.delete_messages(self.target_channel, message["message_id"])
-                        self.logger.info(f"删除失效消息: {message['message_id']}")
-                        messages.remove(message)
-                    except RPCError as e:
-                        self.logger.error(f"删除消息失败: {e}")
-            
-            # 处理123网盘，只有所有链接都失效时才删除
-            self.logger.warning("注意：123网盘检测较为严格，可能会有误判，请谨慎删除")
-            messages_123 = data_123["messages"]
-            for message in messages_123[:]:
-                if message.get("invalid_urls") and len(message.get("invalid_urls", [])) == len(message.get("urls", [])):
-                    try:
-                        await self.client.delete_messages(self.target_channel, message["message_id"])
-                        self.logger.info(f"删除123网盘失效消息: {message['message_id']}")
-                        messages_123.remove(message)
-                    except RPCError as e:
-                        self.logger.error(f"删除123网盘消息失败: {e}")
-
-        await self.save_json_data(data_normal, self.json_path_normal)
-        await self.save_json_data(data_123, self.json_path_123)
-
-    # 重新检测失效链接
-    async def recheck_invalid_urls(self, concurrency=500):
-        """重新检测所有标记为失效的链接，并更新JSON"""
-        data_normal = await self.load_json_data(self.json_path_normal)
-        data_123 = await self.load_json_data(self.json_path_123)
-
-        invalid_urls_123 = []
-        invalid_urls_normal = []
-        url_to_message = {}
-
-        # 收集所有失效链接
-        for message in data_normal["messages"] + data_123["messages"]:
-            for url in message.get("invalid_urls", []):
+    async def _check_all_urls(self, messages: list[dict], concurrency: int):
+        all_urls_123, all_urls_normal, url_to_mid = [], [], {}
+        for message in messages:
+            for url in message["urls"]:
+                url_to_mid[url] = message["message_id"]
                 if "123" in url:
-                    invalid_urls_123.append(url)
+                    all_urls_123.append(url)
                 else:
-                    invalid_urls_normal.append(url)
-                url_to_message[url] = message
+                    all_urls_normal.append(url)
 
-        self.logger.info(f"总共有 {len(invalid_urls_123)} 条123网盘失效链接和 {len(invalid_urls_normal)} 条其他网盘失效链接需要重新检测")
-
+        self.logger.info(
+            f"待检测: {len(all_urls_123)} 条123链接, {len(all_urls_normal)} 条其他链接"
+        )
         semaphore_123 = asyncio.Semaphore(min(10, concurrency))
         semaphore_normal = asyncio.Semaphore(concurrency)
+        invalid_by_mid: dict[int, list] = {}
 
-        async def check_with_semaphore(url, semaphore):
-            return await self.check_url(url, semaphore)
-
-        # 重新检测123网盘链接
-        if invalid_urls_123:
-            tasks_123 = [check_with_semaphore(url, semaphore_123) for url in invalid_urls_123]
+        async def run_checks(urls, sem, conc):
+            results = {}
+            if not urls:
+                return results
+            tasks = [self.check_url(u, sem) for u in urls]
             try:
-                results_123 = await asyncio.wait_for(
-                    asyncio.gather(*tasks_123, return_exceptions=True),
-                    timeout=max(120.0, len(invalid_urls_123) / 10 * 10)
+                outs = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=max(120.0, len(urls) / max(1, conc) * 10),
                 )
-                for url, result in zip(invalid_urls_123, results_123):
-                    if result and not isinstance(result, Exception):
-                        # 如果重新检测有效，从invalid_urls中移除
-                        url_to_message[url]["invalid_urls"] = [u for u in url_to_message[url]["invalid_urls"] if u != url]
-                        self.logger.info(f"链接 {url} 重新检测有效，已从失效列表移除")
+                for url, result in zip(urls, outs):
+                    if not result or isinstance(result, Exception):
+                        results[url] = False
             except asyncio.TimeoutError:
-                self.logger.error(f"123网盘失效链接重新检测超时，总链接数: {len(invalid_urls_123)}")
+                self.logger.error(f"链接检测超时，共 {len(urls)} 条")
+                for url in urls:
+                    results[url] = False
+            return results
 
-        # 重新检测其他网盘链接
-        if invalid_urls_normal:
-            tasks_normal = [check_with_semaphore(url, semaphore_normal) for url in invalid_urls_normal]
+        bad_123 = await run_checks(all_urls_123, semaphore_123, min(10, concurrency))
+        bad_normal = await run_checks(all_urls_normal, semaphore_normal, concurrency)
+        for url, bad in {**bad_123, **bad_normal}.items():
+            if bad:
+                mid = url_to_mid[url]
+                invalid_by_mid.setdefault(mid, [])
+                if url not in invalid_by_mid[mid]:
+                    invalid_by_mid[mid].append(url)
+
+        for mid, invalids in invalid_by_mid.items():
+            self.db.update_link_check_invalid(mid, invalids)
+        return invalid_by_mid
+
+    async def _delete_invalid_messages(self, messages: list[dict], include_123: bool = True):
+        for message in messages:
+            invalid = message.get("invalid_urls", [])
+            if not invalid:
+                continue
+            if message.get("is_123") and include_123:
+                if len(invalid) < len(message.get("urls", [])):
+                    continue
+                self.logger.warning("123网盘消息全部链接失效，谨慎删除")
             try:
-                results_normal = await asyncio.wait_for(
-                    asyncio.gather(*tasks_normal, return_exceptions=True),
-                    timeout=max(120.0, len(invalid_urls_normal) / concurrency * 10)
-                )
-                for url, result in zip(invalid_urls_normal, results_normal):
-                    if result and not isinstance(result, Exception):
-                        # 如果重新检测有效，从invalid_urls中移除
-                        url_to_message[url]["invalid_urls"] = [u for u in url_to_message[url]["invalid_urls"] if u != url]
-                        self.logger.info(f"链接 {url} 重新检测有效，已从失效列表移除")
-            except asyncio.TimeoutError:
-                self.logger.error(f"其他网盘失效链接重新检测超时，总链接数: {len(invalid_urls_normal)}")
+                await self.client.delete_messages(self.target_channel, message["message_id"])
+                self.logger.info(f"删除失效消息: {message['message_id']}")
+                self.db.remove_link_check_message(message["message_id"])
+            except RPCError as e:
+                self.logger.error(f"删除消息失败: {e}")
 
-        await self.save_json_data(data_normal, self.json_path_normal)
-        await self.save_json_data(data_123, self.json_path_123)
+    async def _edit_invalid_messages(self, messages: list[dict]):
+        for message in messages:
+            invalid = message.get("invalid_urls", [])
+            if not invalid or message.get("edited"):
+                continue
+            if message.get("is_123") and len(invalid) < len(message.get("urls", [])):
+                continue
+            try:
+                msg = await self.client.get_messages(self.target_channel, ids=message["message_id"])
+                if not msg or not msg.text:
+                    continue
+                text = msg.text
+                for url in invalid:
+                    if url in text:
+                        text = text.replace(url, f"[已失效] {url}")
+                if self.INVALID_MARKER not in text:
+                    text += f"\n\n{self.INVALID_MARKER}"
+                await self.client.edit_message(self.target_channel, message["message_id"], text)
+                self.db.mark_link_check_edited(message["message_id"])
+                self.logger.info(f"已编辑标记失效消息: {message['message_id']}")
+            except RPCError as e:
+                self.logger.error(f"编辑消息失败: {e}")
 
-    # 主运行逻辑
+    async def process_messages(self, delete, concurrency=500):
+        messages = self.db.get_all_link_check_messages()
+        if delete in (1, 2, 4):
+            await self._check_all_urls(messages, concurrency)
+
+        messages = self.db.get_all_link_check_messages()
+
+        if delete == 1:
+            normal = [m for m in messages if not m.get("is_123")]
+            pan123 = [m for m in messages if m.get("is_123")]
+            await self._delete_invalid_messages(normal, include_123=False)
+            await self._delete_invalid_messages(pan123, include_123=True)
+        elif delete == 3:
+            await self._delete_invalid_messages(messages)
+        elif delete == 4:
+            await self._edit_invalid_messages(messages)
+
+    async def recheck_invalid_urls(self, concurrency=500):
+        """重新检测标记为失效的链接。"""
+        messages = self.db.get_all_link_check_messages()
+        invalid_urls = []
+        url_to_mid = {}
+        for message in messages:
+            for url in message.get("invalid_urls", []):
+                invalid_urls.append(url)
+                url_to_mid[url] = message["message_id"]
+
+        if not invalid_urls:
+            return
+
+        self.logger.info(f"重新检测 {len(invalid_urls)} 条失效链接")
+        sem = asyncio.Semaphore(min(concurrency, 50))
+        tasks = [self.check_url(u, sem) for u in invalid_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleared_mids = set()
+        for url, result in zip(invalid_urls, results):
+            if result and not isinstance(result, Exception):
+                mid = url_to_mid[url]
+                msg = next(m for m in messages if m["message_id"] == mid)
+                new_invalid = [u for u in msg["invalid_urls"] if u != url]
+                self.db.update_link_check_invalid(mid, new_invalid)
+                cleared_mids.add(mid)
+                self.logger.info(f"链接 {url} 重新检测有效")
+
+        for mid in cleared_mids:
+            self.logger.debug(f"消息 {mid} 失效列表已更新")
+
     async def run_async(self, delete, limit=None, concurrency=500, recheck=False):
-        if delete in [1, 2]:
+        if delete in [1, 2, 4]:
             await self.fetch_and_save_all_messages(limit)
-            await self.process_messages(delete=2, concurrency=concurrency)  # 始终先以检测模式运行
-            if recheck:  # 如果指定重新检测
+            await self.process_messages(delete=2, concurrency=concurrency)
+            if recheck:
                 await self.recheck_invalid_urls(concurrency)
-            
-            # 在重新检测后，如果原始模式是删除模式，则执行删除操作
             if delete == 1:
-                # 专门处理删除操作
-                data_normal = await self.load_json_data(self.json_path_normal)
-                data_123 = await self.load_json_data(self.json_path_123)
-                
-                # 先处理普通网盘消息
-                messages = data_normal["messages"]
-                for message in messages[:]:
-                    if message.get("invalid_urls"):
-                        try:
-                            await self.client.delete_messages(self.target_channel, message["message_id"])
-                            self.logger.info(f"删除失效消息: {message['message_id']}")
-                            messages.remove(message)
-                        except RPCError as e:
-                            self.logger.error(f"删除消息失败: {e}")
-                
-                # 对于123网盘消息，考虑到其特殊性，只有在确认消息中所有链接都失效时才删除
-                self.logger.warning("注意：123网盘检测较为严格，可能会有误判，请谨慎删除")
-                messages_123 = data_123["messages"]
-                for message in messages_123[:]:
-                    if message.get("invalid_urls") and len(message.get("invalid_urls", [])) == len(message.get("urls", [])):
-                        try:
-                            await self.client.delete_messages(self.target_channel, message["message_id"])
-                            self.logger.info(f"删除123网盘失效消息: {message['message_id']}")
-                            messages_123.remove(message)
-                        except RPCError as e:
-                            self.logger.error(f"删除123网盘消息失败: {e}")
-                
-                await self.save_json_data(data_normal, self.json_path_normal)
-                await self.save_json_data(data_123, self.json_path_123)
+                await self.process_messages(delete=1, concurrency=concurrency)
+            elif delete == 4:
+                await self.process_messages(delete=4, concurrency=concurrency)
         else:
             await self.process_messages(delete, concurrency)
 
     def run(self, delete=None, limit=None, concurrency=None, recheck=None):
-        # 如果没有指定参数，则使用配置中的默认值
         delete = delete if delete is not None else self.config["DELETE_MODE"]
         limit = limit if limit is not None else self.config["LIMIT"]
         concurrency = concurrency if concurrency is not None else self.config["CONCURRENCY"]
         recheck = recheck if recheck is not None else self.config["RECHECK"]
-        
-        with self.client.start():
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self.run_async(delete, limit, concurrency, recheck))
+
+        async def _run():
+            await self.run_async(delete, limit, concurrency, recheck)
+            if self._owns_client:
+                await self.client.disconnect()
+
+        if self._owns_client:
+            with self.client.start():
+                self.client.loop.run_until_complete(_run())
+        else:
+            self.client.loop.run_until_complete(_run())
 
 
 if __name__ == "__main__":

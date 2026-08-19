@@ -25,3 +25,17 @@ services:
       - API_HASH=${API_HASH}
       - STRING_SESSION=${STRING_SESSION}
     command: python main.py check-links
+
+  bot:
+    build: .
+    container_name: tg-admin-bot
+    restart: unless-stopped
+    profiles: ["bot"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - STRING_SESSION=${STRING_SESSION}
+    command: python main.py bot

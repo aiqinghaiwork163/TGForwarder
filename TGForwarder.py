@@ -19,6 +19,8 @@ from collections import deque
 from utils.link_utils import LINK_PATTERN, URLS_KW, extract_links as _extract_links, normalize_link_key
 from utils.config_loader import build_proxy
 from utils.logging_setup import setup_logging
+from utils.database import Database
+from utils.tmdb import TMDBClient, enrich_message, parse_title
 
 '''
 代理参数说明:
@@ -34,8 +36,18 @@ class TGForwarder:
     def __init__(self, api_id, api_hash, string_session, channels_groups_monitor, forward_to_channel,
                  limit, replies_limit, include, exclude, check_replies, proxy, checknum, replacements,
                  message_md, channel_match, hyperlink_text, past_years, only_today, try_join,
-                 incremental=True, history_file='history.json', log_level='INFO'):
+                 incremental=True, history_file='history.json', log_level='INFO',
+                 db_path='data/tgforwarder.db', tmdb_cfg=None, client=None):
         self.logger = setup_logging(log_level)
+        self.db = Database(db_path)
+        self.db.migrate_from_json(history_file)
+        self.tmdb_cfg = tmdb_cfg or {}
+        self.tmdb_client = None
+        if self.tmdb_cfg.get("enabled") and self.tmdb_cfg.get("api_key"):
+            self.tmdb_client = TMDBClient(
+                self.tmdb_cfg["api_key"],
+                self.tmdb_cfg.get("language", "zh-CN"),
+            )
         self.urls_kw = URLS_KW
         self.checkbox = {
             "links": [], "link_keys": [], "sizes": [], "bot_links": {},
@@ -75,7 +87,11 @@ class TGForwarder:
         self.check_replies = check_replies
         self.download_folder = 'downloads'
         self.try_join = try_join
-        self.client = TelegramClient(StringSession(string_session), api_id, api_hash, proxy=proxy)
+        if client:
+            self.client = client
+        else:
+            self.client = TelegramClient(StringSession(string_session), api_id, api_hash, proxy=proxy)
+        self._owns_client = client is None
 
     @classmethod
     def from_config(cls, cfg: dict) -> "TGForwarder":
@@ -85,6 +101,7 @@ class TGForwarder:
         flt = cfg.get("filters", {})
         dedup = cfg.get("dedup", {})
         log_cfg = cfg.get("logging", {})
+        db_cfg = cfg.get("database", {})
         return cls(
             api_id=tg["api_id"],
             api_hash=tg["api_hash"],
@@ -108,6 +125,8 @@ class TGForwarder:
             incremental=mon.get("incremental", True),
             history_file=cfg.get("history_file", "history.json"),
             log_level=log_cfg.get("level", "INFO"),
+            db_path=db_cfg.get("path", "data/tgforwarder.db"),
+            tmdb_cfg=cfg.get("tmdb"),
         )
 
     def _link_exists(self, url: str, link_keys: list) -> bool:
@@ -147,56 +166,73 @@ class TGForwarder:
                     message = message.replace(word, target_word)
         message = message.strip()
         return message
-    async def dispatch_channel(self, message, jumpLinks=[], F=False):
+
+    async def _prepare_text(self, text: str, source_channel: str = "") -> tuple[str, dict | None]:
+        text = self.replace_targets(text)
+        meta = None
+        if self.tmdb_client:
+            text, meta = await enrich_message(text, self.tmdb_client)
+        return text, meta
+
+    async def _index_sent(self, text: str, target: str, source: str, meta: dict | None, link_keys: list):
+        title = (meta or {}).get("title") or parse_title(text) or ""
+        self.db.index_resource(
+            message_id=None,
+            target_channel=target,
+            title=title,
+            raw_text=text[:2000],
+            link_keys=link_keys[-5:] if link_keys else [],
+            source_channel=source,
+            year=(meta or {}).get("year", ""),
+            rating=(meta or {}).get("rating"),
+            genres=(meta or {}).get("genres", ""),
+            tmdb_id=(meta or {}).get("tmdb_id"),
+        )
+    async def dispatch_channel(self, message, jumpLinks=[], F=False, source_channel=""):
         hit = False
         if self.channel_match:
             for rule in self.channel_match:
                 if rule.get('include'):
-                    if not self.contains(message.message, rule['include']):
+                    if not self.contains(message.message or '', rule['include']):
                         continue
                 if rule.get('exclude'):
-                    if not self.nocontains(message.message, rule['exclude']):
+                    if not self.nocontains(message.message or '', rule['exclude']):
                         continue
-                await self.send(message, rule['target'], jumpLinks, F)
+                await self.send(message, rule['target'], jumpLinks, F, source_channel)
                 hit = True
             if not hit:
-                await self.send(message, self.forward_to_channel, jumpLinks, F)
+                await self.send(message, self.forward_to_channel, jumpLinks, F, source_channel)
         else:
-            await self.send(message, self.forward_to_channel, jumpLinks, F)
-    async def send(self, message, target_chat_name, jumpLinks=[], F=False):
-        text = message.message
+            await self.send(message, self.forward_to_channel, jumpLinks, F, source_channel)
+    async def send(self, message, target_chat_name, jumpLinks=[], F=False, source_channel=""):
+        text = message.message or ""
         if jumpLinks and self.hyperlink_text:
             categorized_urls = self.categorize_urls(jumpLinks)
-            # 遍历每个分类
-            for category, keywords in hyperlink_text.items():
-                # 获取该分类的第一个 URL（如果有）
+            for category, keywords in self.hyperlink_text.items():
                 if categorized_urls.get(category):
                     slinks = categorized_urls[category]
                     url = "\n".join(slinks)
                     url += '\n@@'
-                    # 遍历关键词并替换
                     for keyword in keywords:
                         if keyword in text:
                             text = text.replace(keyword, url)
                             break
-                else:
-                    continue  # 如果没有 URL，跳过
-        text = text.replace('@@','')
+        text = text.replace('@@', '')
         if self.nocontains(text, self.urls_kw):
             return
+        text, meta = await self._prepare_text(text, source_channel)
         try:
             if message.media and isinstance(message.media, MessageMediaPhoto):
                 if F:
                     media = await message.download_media(self.download_folder)
-                    await self.client.send_file(target_chat_name, media, caption=self.replace_targets(text))
+                    await self.client.send_file(target_chat_name, media, caption=text)
                 else:
-                    await self.client.send_message(
-                        target_chat_name,
-                        self.replace_targets(text),  # 复制消息文本
-                        file=message.media  # 复制消息的媒体文件
-                    )
+                    await self.client.send_message(target_chat_name, text, file=message.media)
             else:
-                await self.client.send_message(target_chat_name, self.replace_targets(text))
+                await self.client.send_message(target_chat_name, text)
+            links_in_msg = _extract_links(text)
+            keys = [normalize_link_key(u) for u in links_in_msg]
+            await self._index_sent(text, target_chat_name, source_channel, meta, keys)
         except Exception as e:
             self.logger.error(f'发送消息失败: {e}')
     async def get_peer(self,client, channel_name):
@@ -491,24 +527,22 @@ class TGForwarder:
         links = []
         link_keys = []
         sizes = []
-        if os.path.exists(self.history):
-            with open(self.history, 'r', encoding='utf-8') as f:
-                self.checkbox = json.loads(f.read())
-                if self.checkbox.get('today') == datetime.now().strftime("%Y-%m-%d"):
-                    links = self.checkbox.get('links', [])
-                    link_keys = self.checkbox.get('link_keys', [])
-                    if not link_keys and links:
-                        link_keys = [normalize_link_key(u) for u in links]
-                    sizes = self.checkbox.get('sizes', [])
-                else:
-                    self.checkbox['links'] = []
-                    self.checkbox['link_keys'] = []
-                    self.checkbox['sizes'] = []
-                    self.checkbox["bot_links"] = {}
-                    self.checkbox["today_count"] = 0
-                if 'channel_state' not in self.checkbox:
-                    self.checkbox['channel_state'] = {}
-                self.today_count = self.checkbox.get('today_count') if self.checkbox.get('today_count') else self.checknum
+        self.checkbox = self.db.load_forwarder_state()
+        if self.checkbox.get('today') == datetime.now().strftime("%Y-%m-%d"):
+            links = self.checkbox.get('links', [])
+            link_keys = self.checkbox.get('link_keys', [])
+            if not link_keys and links:
+                link_keys = [normalize_link_key(u) for u in links]
+            sizes = self.checkbox.get('sizes', [])
+        else:
+            self.checkbox['links'] = []
+            self.checkbox['link_keys'] = []
+            self.checkbox['sizes'] = []
+            self.checkbox["bot_links"] = {}
+            self.checkbox["today_count"] = 0
+        if 'channel_state' not in self.checkbox:
+            self.checkbox['channel_state'] = {}
+        self.today_count = self.checkbox.get('today_count') if self.checkbox.get('today_count') else self.checknum
         self.checknum = self.checknum if self.today_count < self.checknum else self.today_count
         chat = await self.client.get_entity(self.forward_to_channel)
         messages = self.client.iter_messages(chat, limit=self.checknum)
@@ -664,7 +698,7 @@ class TGForwarder:
                         if matches or jumpLinks:
                             link = jumpLinks[0] if jumpLinks else matches[0]
                             if not self._link_exists(link, link_keys):
-                                await self.dispatch_channel(message, jumpLinks, F)
+                                await self.dispatch_channel(message, jumpLinks, F, channel_key)
                                 self.forward_count += 1
                                 self._record_link(link, links, link_keys)
                             else:
@@ -678,7 +712,7 @@ class TGForwarder:
                             if matches or jumpLinks:
                                 link = jumpLinks[0] if jumpLinks else matches[0]
                                 if not self._link_exists(link, link_keys):
-                                    await self.dispatch_channel(r, jumpLinks, F)
+                                    await self.dispatch_channel(r, jumpLinks, F, channel_key)
                                     self.forward_count += 1
                                     self._record_link(link, links, link_keys)
                                 else:
@@ -690,7 +724,7 @@ class TGForwarder:
                         if matches or jumpLinks:
                             link = jumpLinks[0] if jumpLinks else matches[0]
                             if not self._link_exists(link, link_keys):
-                                await self.dispatch_channel(message, jumpLinks)
+                                await self.dispatch_channel(message, jumpLinks, source_channel=channel_key)
                                 self.forward_count += 1
                                 self._record_link(link, links, link_keys)
                             else:
@@ -735,20 +769,25 @@ class TGForwarder:
                 self.logger.error(f"处理频道 {chat_name} 异常: {e}")
                 continue
         await self.send_daily_forwarded_count()
-        with open(self.history, 'w+', encoding='utf-8') as f:
-            self.checkbox['links'] = list(set(links))[-self.checkbox["today_count"]:]
-            self.checkbox['link_keys'] = list(dict.fromkeys(link_keys))[-self.checkbox["today_count"]:]
-            self.checkbox['sizes'] = list(set(sizes))[-self.checkbox["today_count"]:]
-            self.checkbox['today'] = datetime.now().strftime("%Y-%m-%d")
-            f.write(json.dumps(self.checkbox, ensure_ascii=False))
+        self.checkbox['links'] = list(set(links))[-self.checkbox["today_count"]:]
+        self.checkbox['link_keys'] = list(dict.fromkeys(link_keys))[-self.checkbox["today_count"]:]
+        self.checkbox['sizes'] = list(set(sizes))[-self.checkbox["today_count"]:]
+        self.checkbox['today'] = datetime.now().strftime("%Y-%m-%d")
+        self.db.save_forwarder_state(self.checkbox)
         if os.path.exists(self.download_folder):
             shutil.rmtree(self.download_folder)
         await self.deduplicate_links()
-        await self.client.disconnect()
+        if self._owns_client:
+            await self.client.disconnect()
         elapsed = time.time() - start_time
         self.logger.info(f'任务完成，共转发 {total_forwarded} 条，耗时 {elapsed:.1f} 秒')
     def run(self):
-        with self.client.start():
+        if self._owns_client:
+            with self.client.start():
+                if self.try_join:
+                    self.client.loop.run_until_complete(self.join_channels())
+                self.client.loop.run_until_complete(self.main())
+        else:
             if self.try_join:
                 self.client.loop.run_until_complete(self.join_channels())
             self.client.loop.run_until_complete(self.main())
