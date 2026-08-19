@@ -1,0 +1,9 @@
+config.yaml
+.env
+history.json
+messages.json
+messages_123.json
+downloads/
+__pycache__/
+*.pyc
+.pytest_cache/

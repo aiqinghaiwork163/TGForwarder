@@ -9,19 +9,15 @@ from telethon.sessions import StringSession
 from telethon.errors import RPCError
 from bs4 import BeautifulSoup
 
+from utils.link_utils import extract_share_id, extract_net_disk_urls
+from utils.config_loader import build_proxy
+from utils.logging_setup import setup_logging
+
 
 class TelegramLinkManager:
     def __init__(self, config):
-        # 配置日志
-        logging.basicConfig(
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=logging.INFO
-        )
-        self.logger = logging.getLogger(__name__)
-        
-        # 屏蔽 httpx 的 INFO 日志
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        
+        log_level = config.get("LOG_LEVEL", "INFO")
+        self.logger = setup_logging(log_level)
         self.config = config
         # 初始化Telethon客户端
         self.client = TelegramClient(
@@ -36,26 +32,33 @@ class TelegramLinkManager:
         self.batch_size = config["BATCH_SIZE"]
         self.net_disk_domains = config["NET_DISK_DOMAINS"]
 
-    # 提取消息中的网盘链接
+    @classmethod
+    def from_config(cls, cfg: dict) -> "TelegramLinkManager":
+        """从 config.yaml 构建实例。"""
+        tg = cfg["telegram"]
+        lc = cfg.get("link_checker", {})
+        log_cfg = cfg.get("logging", {})
+        config = {
+            "API_ID": tg["api_id"],
+            "API_HASH": tg["api_hash"],
+            "STRING_SESSION": tg["string_session"],
+            "JSON_PATH_NORMAL": lc.get("json_path_normal", "messages.json"),
+            "JSON_PATH_123": lc.get("json_path_123", "messages_123.json"),
+            "TARGET_CHANNEL": tg.get("target_channel") or tg["forward_to_channel"],
+            "PROXY": build_proxy(cfg.get("proxy")),
+            "BATCH_SIZE": lc.get("batch_size", 500),
+            "DELETE_MODE": lc.get("delete_mode", 2),
+            "LIMIT": lc.get("limit", 1000),
+            "CONCURRENCY": lc.get("concurrency", 20),
+            "RECHECK": lc.get("recheck", True),
+            "NET_DISK_DOMAINS": lc.get("net_disk_domains"),
+            "LOG_LEVEL": log_cfg.get("level", "INFO"),
+        }
+        return cls(config)
+
     def extract_links(self, message_text: str):
         """从消息文本中提取网盘链接"""
-        if not message_text:
-            self.logger.debug("消息文本为空，跳过提取")
-            return []
-        url_pattern = r'https?://[^\s]+'
-        urls = re.findall(url_pattern, message_text)
-        net_disk_domains = self.net_disk_domains if self.net_disk_domains else [
-            'aliyundrive.com', 'alipan.com',
-            'pan.quark.cn',
-            '115.com', '115cdn.com', 'anxia.com',
-            'pan.baidu.com', 'yun.baidu.com',
-            'mypikpak.com',
-            '123684.com', '123685.com', '123912.com', '123pan.com', '123pan.cn', '123592.com',
-            'cloud.189.cn',
-            'drive.uc.cn'
-        ]
-        links = [url for url in urls if any(domain in url for domain in net_disk_domains)]
-        return links
+        return extract_net_disk_urls(message_text, self.net_disk_domains)
 
     # 异步读取JSON文件
     async def load_json_data(self, json_path: str):
@@ -146,25 +149,9 @@ class TelegramLinkManager:
 
         self.logger.info(f"所有新消息保存完成，总计 {total_new_messages} 条")
 
-    # 提取分享ID
     def extract_share_id(self, url: str):
-        """从链接中提取分享ID，支持多域名网盘"""
-        net_disk_patterns = {
-            'uc': {'domains': ['drive.uc.cn'], 'pattern': r"https?://drive\.uc\.cn/s/([a-zA-Z0-9]+)"},
-            'aliyun': {'domains': ['aliyundrive.com', 'alipan.com'], 'pattern': r"https?://(?:www\.)?(?:aliyundrive|alipan)\.com/s/([a-zA-Z0-9]+)"},
-            'quark': {'domains': ['pan.quark.cn'], 'pattern': r"https?://(?:www\.)?pan\.quark\.cn/s/([a-zA-Z0-9]+)"},
-            '115': {'domains': ['115.com', '115cdn.com', 'anxia.com'], 'pattern': r"https?://(?:www\.)?(?:115|115cdn|anxia)\.com/s/([a-zA-Z0-9]+)"},
-            'baidu': {'domains': ['pan.baidu.com', 'yun.baidu.com'], 'pattern': r"https?://(?:[a-z]+\.)?(?:pan|yun)\.baidu\.com/(?:s/|share/init\?surl=)([a-zA-Z0-9_-]+)(?:\?|$)"},
-            'pikpak': {'domains': ['mypikpak.com'], 'pattern': r"https?://(?:www\.)?mypikpak\.com/s/([a-zA-Z0-9]+)"},
-            '123': {'domains': ['123684.com', '123685.com', '123912.com', '123pan.com', '123pan.cn', '123592.com'], 'pattern': r"https?://(?:www\.)?(?:123684|123685|123912|123pan|123pan\.cn|123592)\.com/s/([a-zA-Z0-9-]+)"},
-            'tianyi': {'domains': ['cloud.189.cn'], 'pattern': r"https?://cloud\.189\.cn/(?:t/|web/share\?code=)([a-zA-Z0-9]+)"}
-        }
-        for net_disk, config in net_disk_patterns.items():
-            if any(domain in url for domain in config['domains']):
-                match = re.search(config['pattern'], url)
-                if match:
-                    return match.group(1), net_disk
-        return None, None
+        """从链接中提取分享ID（委托 utils）。"""
+        return extract_share_id(url)
 
     # 检查网盘链接有效性
     async def check_uc(self, share_id: str):
@@ -532,42 +519,15 @@ class TelegramLinkManager:
             loop.run_until_complete(self.run_async(delete, limit, concurrency, recheck))
 
 
-# 示例使用
 if __name__ == "__main__":
-    logger = logging.getLogger(__name__)
-    logger.info(f"当前工作目录: {os.getcwd()}")
-    
-    # 配置项
-    CONFIG = {
-        # Telethon客户端配置
-        "API_ID": 6627460,
-        "API_HASH": "27a53a0965e486a2bc1b1fcde473b1c4",
-        "STRING_SESSION": "xxx",
-        "JSON_PATH_NORMAL": os.path.join(os.getcwd(), "messages.json"),
-        "JSON_PATH_123": os.path.join(os.getcwd(), "messages_123.json"),
-        "TARGET_CHANNEL": "tgsearchers",
-        "PROXY": None,
-        "BATCH_SIZE": 500,
-        # 运行配置
-        "DELETE_MODE": 2,  # 1: 检测并删除 (重新检测后再删除), 2: 仅检测, 3: 删除标记为失效的消息
-        "LIMIT": 1000,     # 每次检测的最大消息数量
-        "CONCURRENCY": 20, # 并发数
-        "RECHECK": True,    # 是否重新检测标记为失效的链接
-        "NET_DISK_DOMAINS": 
-        [
-            'pan.quark.cn',
-            # 'aliyundrive.com', 'alipan.com',
-            # '115.com', '115cdn.com', 'anxia.com',
-            # 'pan.baidu.com', 'yun.baidu.com',
-            # 'mypikpak.com',
-            # '123684.com', '123685.com', '123912.com', '123pan.com', '123pan.cn', '123592.com',
-            # 'cloud.189.cn',
-            # 'drive.uc.cn'
-        ]
-    }
-    
-    # 创建管理器实例
-    manager = TelegramLinkManager(CONFIG)
-    
-    # 运行主程序 - 使用配置中的默认设置
-    manager.run()
+    import sys
+    from pathlib import Path
+
+    config_path = Path('config.yaml')
+    if config_path.exists():
+        from utils.config_loader import load_config
+        manager = TelegramLinkManager.from_config(load_config())
+        manager.run()
+    else:
+        print("未找到 config.yaml，请复制 config.yaml.example 并填写参数，或使用: python main.py check-links")
+        sys.exit(1)
