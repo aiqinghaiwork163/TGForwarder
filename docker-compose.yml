@@ -1,0 +1,27 @@
+services:
+  forwarder:
+    build: .
+    container_name: tgforwarder
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - STRING_SESSION=${STRING_SESSION}
+    command: python main.py forward
+
+  link-checker:
+    build: .
+    container_name: tg-link-checker
+    restart: "no"
+    profiles: ["checker"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - STRING_SESSION=${STRING_SESSION}
+    command: python main.py check-links
